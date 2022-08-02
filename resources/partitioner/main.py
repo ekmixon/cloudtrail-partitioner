@@ -27,7 +27,7 @@ def get_session():
     try:
         session = boto3.Session(profile_name=args.profile)
     except Exception as e:
-        print('%s' % e)
+        print(f'{e}')
         sys.exit(1)
 
     return session
@@ -51,7 +51,7 @@ class athena_querier:
         )
 
     def query(self, query, context=None, skip_header=True):
-        logging.debug("Making query {}".format(query))
+        logging.debug(f"Making query {query}")
 
         # Make query request dependent on whether the context is None or not
         if context is None:
@@ -78,18 +78,14 @@ class athena_querier:
         for response in response_iterator:
             for row in response["ResultSet"]["Rows"]:
                 row_count += 1
-                if row_count == 1:
-                    if skip_header:
-                        # Skip header
-                        continue
+                if row_count == 1 and skip_header:
+                    # Skip header
+                    continue
                 rows.append(self.extract_response_values(row))
         return rows
 
     def extract_response_values(self, row):
-        result = []
-        for column in row["Data"]:
-            result.append(column.get("VarCharValue", ""))
-        return result
+        return [column.get("VarCharValue", "") for column in row["Data"]]
 
     def wait_for_query_to_complete(self, queryExecutionId):
         """
@@ -104,7 +100,7 @@ class athena_querier:
             state = response["QueryExecution"]["Status"]["State"]
             if state == "SUCCEEDED":
                 return True
-            if state == "FAILED" or state == "CANCELLED":
+            if state in ["FAILED", "CANCELLED"]:
                 raise Exception(
                     "Query entered state {state} with reason {reason}".format(
                         state=state,
@@ -113,14 +109,12 @@ class athena_querier:
                         ],
                     )
                 )
-            logging.debug(
-                "Sleeping 1 second while query {} completes".format(queryExecutionId)
-            )
+            logging.debug(f"Sleeping 1 second while query {queryExecutionId} completes")
             time.sleep(1)
 
 
 def main():
-    print("Starting cloudtrail_partitioner {}".format(__version__))
+    print(f"Starting cloudtrail_partitioner {__version__}")
 
     # Read config
     config = {}
@@ -130,7 +124,7 @@ def main():
             config = yaml.safe_load(stream)
     except Exception as e:
         print("Unable to open config file, will try getting config from environment variables")
-    
+
     # Override the config file with the environment variables
     if 'S3_BUCKET_CONTAINING_LOGS' in os.environ:
         config['s3_bucket_containing_logs'] = os.environ['S3_BUCKET_CONTAINING_LOGS']
@@ -151,15 +145,16 @@ def main():
     # Check the credentials and get the current region and account id
     sts = get_session().client("sts")
     identity = sts.get_caller_identity()
-    print("Using AWS identity: {}".format(identity["Arn"]))
+    print(f'Using AWS identity: {identity["Arn"]}')
     current_account_id = identity["Account"]
     current_region = get_session().region_name
 
     # Get the default output bucket if one is not given
     if config['output_s3_bucket'] == 'default':
-        config['output_s3_bucket'] = "aws-athena-query-results-{}-{}".format(
-            current_account_id, current_region
-        )
+        config[
+            'output_s3_bucket'
+        ] = f"aws-athena-query-results-{current_account_id}-{current_region}"
+
 
     db_context = {"Database": config['database']}
 
@@ -168,10 +163,7 @@ def main():
     # Get all regions (needed for creating partitions)
     ec2 = get_session().client("ec2")
     region_response = ec2.describe_regions(AllRegions=True)["Regions"]
-    regions = []
-    for region in region_response:
-        regions.append(region["RegionName"])
-
+    regions = [region["RegionName"] for region in region_response]
     # Ensure the CloudTrail log folder has the expected contents
     s3 = get_session().client("s3")
     log_path_prefix = config["cloudtrail_prefix"]
@@ -181,7 +173,10 @@ def main():
     if bucket_location is None:
          bucket_location = "us-east-1"
     if current_region != bucket_location:
-        raise Exception("This application must be run from the same region as the bucket. Current location: {}; Bucket location: {}".format(current_region, bucket_location))
+        raise Exception(
+            f"This application must be run from the same region as the bucket. Current location: {current_region}; Bucket location: {bucket_location}"
+        )
+
 
     # Sanity check that everything is well-formed
     resp = s3.list_objects_v2(
@@ -190,7 +185,7 @@ def main():
         Delimiter="/",
         MaxKeys=1,
     )
-    
+
     if "CommonPrefixes" not in resp or len(resp["CommonPrefixes"]) == 0:
         exit(
             "ERROR: S3 bucket has no contents.  Ensure you have logs at s3://{bucket}/{path}".format(
@@ -198,7 +193,7 @@ def main():
             )
         )
 
-    if resp["CommonPrefixes"][0]["Prefix"] != log_path_prefix + "AWSLogs/":
+    if resp["CommonPrefixes"][0]["Prefix"] != f"{log_path_prefix}AWSLogs/":
         exit(
             "ERROR: S3 bucket path is incorrect.  Ensure you have logs at s3://{bucket}/{path}/AWSLogs".format(
                 bucket=config["s3_bucket_containing_logs"], path=log_path_prefix
@@ -206,7 +201,7 @@ def main():
         )
 
     # Identify all accounts in this bucket and what their prefix paths are
-    log_path_prefix = log_path_prefix + "AWSLogs/"
+    log_path_prefix = f"{log_path_prefix}AWSLogs/"
     resp = s3.list_objects_v2(
         Bucket=config["s3_bucket_containing_logs"],
         Prefix=log_path_prefix,
@@ -231,14 +226,14 @@ def main():
         elif re.match("^[0-d]{12}$", directory_name):
             accounts.append({"account_id": directory_name, "path_prefix": prefix})
         else:
-            print("Unexpected folder: {}".format(directory_name))
+            print(f"Unexpected folder: {directory_name}")
 
     # String to hold the SQL query that creates a view to allow searching all the tables.
     view_query = ""
 
     # Create tables and partitions for each account
     for account in accounts:
-        print("Creating table for: {}".format(account["account_id"]))
+        print(f'Creating table for: {account["account_id"]}')
 
         cloudtrail_log_path = "s3://{bucket}/{path}/CloudTrail/".format(
             bucket=config["s3_bucket_containing_logs"], path=account["path_prefix"]
@@ -248,7 +243,7 @@ def main():
 
         if view_query != "":
             view_query += " UNION ALL "
-        view_query += "SELECT * FROM {}".format(table_name)
+        view_query += f"SELECT * FROM {table_name}"
 
         # Set up table
         query = """CREATE EXTERNAL TABLE IF NOT EXISTS `{table_name}` (
@@ -287,7 +282,7 @@ def main():
         )
         athena.query(query, db_context)
 
-        today = datetime.datetime.today()
+        today = datetime.datetime.now()
         # Create partitions
         for day_difference in range(-1, config['partition_days']):
             partition_date = today - datetime.timedelta(days=day_difference)
@@ -311,12 +306,15 @@ def main():
                 )
 
             athena.query(query, db_context)
-        
+
     # Drop the old view
-    athena.query("DROP VIEW IF EXISTS {}".format(config["table_prefix"]))
+    athena.query(f'DROP VIEW IF EXISTS {config["table_prefix"]}')
 
     # Create the view
-    view_query = "CREATE OR REPLACE VIEW {} AS ".format(config["table_prefix"]) + view_query
+    view_query = (
+        f'CREATE OR REPLACE VIEW {config["table_prefix"]} AS ' + view_query
+    )
+
     athena.query(view_query, db_context)
 
     return True    
